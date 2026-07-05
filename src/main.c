@@ -247,6 +247,12 @@ static void uart_cb(const struct device *dev, void *user_data)
 #define HID_KEY_TAB       0x2B
 #define HID_KEY_SPACE     0x2C
 
+#define HID_KEY_INSERT   0x49
+#define HID_KEY_HOME     0x4A
+#define HID_KEY_PAGE_UP  0x4B
+#define HID_KEY_DELETE   0x4C
+#define HID_KEY_END      0x4D
+#define HID_KEY_PAGE_DN  0x4E
 #define HID_KEY_RIGHT 0x4F
 #define HID_KEY_LEFT  0x50
 #define HID_KEY_DOWN  0x51
@@ -416,13 +422,31 @@ static bool ascii_to_hid(uint8_t c, uint8_t *keycode, uint8_t *modifier)
  * (ESC '[' <final-byte>), not as single ASCII codes, so ascii_to_hid()
  * alone can't see them. This tracks how far into such a sequence we are.
  */
+#define ANSI_PARAM_MAX_LEN 8
+
 enum esc_state {
 	ESC_STATE_NONE = 0,
 	ESC_STATE_GOT_ESC,
-	ESC_STATE_GOT_BRACKET,
+	ESC_STATE_GOT_CSI,
+	ESC_STATE_GOT_SS3,
 };
 
-static bool csi_final_to_hid(uint8_t c, uint8_t *keycode)
+static uint16_t ansi_first_param(const uint8_t *params, size_t len)
+{
+	uint16_t value = 0;
+
+	for (size_t i = 0; i < len; i++) {
+		if (params[i] < '0' || params[i] > '9') {
+			break;
+		}
+
+		value = (value * 10U) + (uint16_t)(params[i] - '0');
+	}
+
+	return value;
+}
+
+static bool ansi_arrow_to_hid(uint8_t c, uint8_t *keycode)
 {
 	switch (c) {
 	case 'A':
@@ -440,6 +464,63 @@ static bool csi_final_to_hid(uint8_t c, uint8_t *keycode)
 	}
 
 	return false;
+}
+
+static bool csi_to_hid(const uint8_t *params, size_t len, uint8_t final, uint8_t *keycode)
+{
+	uint16_t param;
+
+	if (ansi_arrow_to_hid(final, keycode)) {
+		return true;
+	}
+
+	if (final != '~') {
+		return false;
+	}
+
+	param = ansi_first_param(params, len);
+	switch (param) {
+	case 1:
+	case 7:
+		*keycode = HID_KEY_HOME;
+		return true;
+	case 2:
+		*keycode = HID_KEY_INSERT;
+		return true;
+	case 3:
+		*keycode = HID_KEY_DELETE;
+		return true;
+	case 4:
+	case 8:
+		*keycode = HID_KEY_END;
+		return true;
+	case 5:
+		*keycode = HID_KEY_PAGE_UP;
+		return true;
+	case 6:
+		*keycode = HID_KEY_PAGE_DN;
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool ss3_to_hid(uint8_t c, uint8_t *keycode)
+{
+	if (ansi_arrow_to_hid(c, keycode)) {
+		return true;
+	}
+
+	switch (c) {
+	case 'H':
+		*keycode = HID_KEY_HOME;
+		return true;
+	case 'F':
+		*keycode = HID_KEY_END;
+		return true;
+	default:
+		return false;
+	}
 }
 
 /* ---------------------------------------------------------------------- */
@@ -512,6 +593,9 @@ int main(void)
 	LOG_INF("HID bridge ready");
 
 	enum esc_state esc_state = ESC_STATE_NONE;
+	uint8_t ansi_params[ANSI_PARAM_MAX_LEN];
+	size_t ansi_param_len = 0;
+	bool suppress_lf = false;
 
 	while (true) {
 		uint8_t c;
@@ -536,25 +620,58 @@ int main(void)
 
 		if (esc_state == ESC_STATE_NONE && c == 0x1b) {
 			esc_state = ESC_STATE_GOT_ESC;
+			ansi_param_len = 0;
+			suppress_lf = false;
 			continue;
 		}
 
 		if (esc_state == ESC_STATE_GOT_ESC) {
 			esc_state = ESC_STATE_NONE;
 			if (c == '[') {
-				esc_state = ESC_STATE_GOT_BRACKET;
+				esc_state = ESC_STATE_GOT_CSI;
+				continue;
+			}
+			if (c == 'O') {
+				esc_state = ESC_STATE_GOT_SS3;
 				continue;
 			}
 			/* Not a recognized CSI sequence: drop the ESC, fall through to c. */
 		}
 
-		if (esc_state == ESC_STATE_GOT_BRACKET) {
+		if (esc_state == ESC_STATE_GOT_CSI) {
+			if (c >= 0x30 && c <= 0x3f) {
+				if (ansi_param_len < sizeof(ansi_params)) {
+					ansi_params[ansi_param_len++] = c;
+				}
+				continue;
+			}
+
+			if (c >= 0x20 && c <= 0x2f) {
+				continue;
+			}
+
 			esc_state = ESC_STATE_NONE;
-			if (kb_ready && csi_final_to_hid(c, &keycode)) {
+			if (c >= 0x40 && c <= 0x7e &&
+			    kb_ready && csi_to_hid(ansi_params, ansi_param_len, c, &keycode)) {
 				send_hid_key(hid_dev, HID_MOD_NONE, keycode);
 			}
 			continue;
 		}
+
+		if (esc_state == ESC_STATE_GOT_SS3) {
+			esc_state = ESC_STATE_NONE;
+			if (kb_ready && ss3_to_hid(c, &keycode)) {
+				send_hid_key(hid_dev, HID_MOD_NONE, keycode);
+			}
+			continue;
+		}
+
+		if (c == '\n' && suppress_lf) {
+			suppress_lf = false;
+			continue;
+		}
+
+		suppress_lf = false;
 
 		if (!ascii_to_hid(c, &keycode, &modifier)) {
 			continue;
@@ -565,6 +682,7 @@ int main(void)
 		}
 
 		send_hid_key(hid_dev, modifier, keycode);
+		suppress_lf = (c == '\r');
 	}
 
 	return 0;
