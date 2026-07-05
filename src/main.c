@@ -274,12 +274,14 @@ static bool ascii_to_hid(uint8_t c, uint8_t *keycode, uint8_t *modifier)
 	case 0x08: /* Backspace (BS) */
 		*keycode = HID_KEY_BACKSPACE;
 		return true;
-	case 0x03: /* Ctrl+C */
-		*modifier = HID_MOD_LEFT_CTRL;
-		*keycode = 0x06; /* 'c' */
-		return true;
 	case ' ':
 		*keycode = HID_KEY_SPACE;
+		return true;
+	}
+
+	if (c >= 0x01 && c <= 0x1A) {
+		*modifier = HID_MOD_LEFT_CTRL;
+		*keycode = 0x04 + (c - 0x01);
 		return true;
 	}
 
